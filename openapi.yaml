@@ -1,0 +1,654 @@
+openapi: 3.1.0
+info:
+  title: starter-gacha API
+  version: "1.0.0"
+  description: |
+    The API behind a gacha machine for physical goods, settled in USDC on Solana.
+    A storefront talks to these routes and nothing else: the server prices every
+    pull, verifies the signed transaction, rolls from the machine record it
+    publishes, freezes the buyback value, and pays a buyback at most once.
+
+    Player routes authenticate with a Privy access token (`Authorization: Bearer`).
+    Operator routes authenticate with a machine's API key (`x-api-key`).
+
+    Sandbox: with `GACHA_SANDBOX=1` on the server, the bearer token is
+    `sandbox:<wallet>`, the operator key is `gk_sandbox_operator` (or
+    `GACHA_SANDBOX_OPERATOR_KEY`), `unsignedTxB64` is an opaque token the client
+    returns unchanged as `signedTxB64`, and signatures are `sandbox_...` strings.
+    Every route, rule and error code is the same as live.
+
+    Every pull pays 1% of the pull price to the course wallet (lib/course-fee.ts)
+    as a second transfer inside the pull transaction; the player pays the listed
+    price once.
+servers:
+  - url: /api/v1
+    description: Same origin (the starter's own Next.js app)
+  - url: http://localhost:3000/api/v1
+    description: Local sandbox (GACHA_SANDBOX=1 next start)
+
+tags:
+  - name: machines
+    description: Public. Odds, prices, tiers, pool depth.
+  - name: pulls
+    description: Player. Quote, settle, read, buyback, ship.
+  - name: operator
+    description: Operator. Inventory and webhooks for the key's machine.
+
+paths:
+  /machines/{id}:
+    get:
+      tags: [machines]
+      summary: Public odds, prices, tiers and pool depth of a machine
+      description: |
+        Read from the machine record. The settle route rolls from the same
+        record, so these odds are the odds the machine rolls with.
+      operationId: getMachine
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/MachineId"
+      responses:
+        "200":
+          description: The machine
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Machine" }
+        "404": { $ref: "#/components/responses/UnknownMachine" }
+
+  /pulls:
+    post:
+      tags: [pulls]
+      summary: Quote and prepare a pull
+      description: |
+        The server identifies the player from the bearer token, prices the pull
+        from the machine record (`tierMeta[tier].price * count`), records it,
+        and returns the unsigned payment transaction for exactly that amount.
+        The body carries no amount and no wallet address. Sign
+        `unsignedTxB64` with the player's wallet (the relayer is the fee payer,
+        so the player holds no SOL) and send it to `/pulls/{id}/settle`.
+      operationId: createPull
+      security: [{ playerToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePullRequest" }
+      responses:
+        "201":
+          description: The quoted pull with `unsignedTxB64`
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Pull"
+                  - type: object
+                    required: [unsignedTxB64]
+                    properties:
+                      unsignedTxB64:
+                        type: string
+                        description: Base64 serialized transaction to sign (sandbox: an opaque token to return unchanged).
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownMachine" }
+        "423": { $ref: "#/components/responses/MachinePaused" }
+        "503": { $ref: "#/components/responses/SettlementUnconfigured" }
+
+  /pulls/{id}:
+    get:
+      tags: [pulls]
+      summary: Read a pull and its slots
+      operationId: getPull
+      security: [{ playerToken: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PullId"
+      responses:
+        "200":
+          description: The pull
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Pull" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownPull" }
+
+  /pulls/{id}/settle:
+    post:
+      tags: [pulls]
+      summary: Verify, co-sign, submit, roll, reserve
+      description: |
+        The server compares the signed transaction instruction by instruction
+        against the one it built for this pull (fee payer, program ids, data
+        bytes, every account's key and flags, the player's signature), then
+        co-signs as fee payer and submits. It marks the pull paid exactly once,
+        rolls every slot from the machine record, reserves one piece per slot
+        atomically, freezes each slot's buyback value, and posts `pull.opened`
+        to the operator's webhooks. A second call returns `already_settled`
+        and never rolls again. If the rolled rarity has no piece in the
+        player's size, the slot is upgraded to the next rarity up, never down.
+      operationId: settlePull
+      security: [{ playerToken: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PullId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [signedTxB64]
+              properties:
+                signedTxB64:
+                  type: string
+                  description: The transaction from `/pulls`, signed by the player, base64.
+      responses:
+        "200":
+          description: The opened pull with its slots
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Pull" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownPull" }
+        "409":
+          description: already_settled or out_of_stock
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/TxMismatch" }
+        "503": { $ref: "#/components/responses/SettlementUnconfigured" }
+
+  /pulls/{id}/buyback:
+    post:
+      tags: [pulls]
+      summary: Sell a slot back for USDC
+      description: |
+        The body names a slot and nothing else (and nothing at all when the
+        pull has one slot). The owner comes from the bearer token, the amount
+        is the value frozen on the slot at roll time, and the on-chain receipt
+        guarantees at most one payout per slot even if the server retries.
+        Posts `buyback.paid`.
+      operationId: buybackSlot
+      security: [{ playerToken: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PullId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SlotRequest" }
+      responses:
+        "200":
+          description: Paid
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BuybackResult" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownPull" }
+        "409":
+          description: already_decided or not_settled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/SettlementUnconfigured" }
+
+  /pulls/{id}/ship:
+    post:
+      tags: [pulls]
+      summary: Keep a slot
+      description: Marks the slot shipped and the piece gone from the pool. Posts `pull.shipped`.
+      operationId: shipSlot
+      security: [{ playerToken: [] }]
+      parameters:
+        - $ref: "#/components/parameters/PullId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SlotRequest" }
+      responses:
+        "200":
+          description: Shipped
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ShipResult" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownPull" }
+        "409":
+          description: already_decided or not_settled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /inventory:
+    get:
+      tags: [operator]
+      summary: Every piece of the key's machine
+      operationId: listInventory
+      security: [{ operatorKey: [] }]
+      responses:
+        "200":
+          description: Inventory
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Inventory" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [operator]
+      summary: Intake pieces
+      description: |
+        Rows in, SKUs out. Rarity is derived from `price` against the machine's
+        standard-tier bands and never accepted from the caller.
+      operationId: intakeInventory
+      security: [{ operatorKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pieces]
+              properties:
+                pieces:
+                  type: array
+                  maxItems: 500
+                  items: { $ref: "#/components/schemas/IntakeRow" }
+      responses:
+        "201":
+          description: The inserted pieces
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Inventory" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /webhooks:
+    get:
+      tags: [operator]
+      summary: Registered endpoints and recent deliveries
+      operationId: listWebhooks
+      security: [{ operatorKey: [] }]
+      responses:
+        "200":
+          description: Endpoints (secrets omitted) and the last 50 deliveries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  machineId: { type: string }
+                  endpoints:
+                    type: array
+                    items: { $ref: "#/components/schemas/WebhookEndpoint" }
+                  deliveries:
+                    type: array
+                    items: { $ref: "#/components/schemas/WebhookDelivery" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [operator]
+      summary: Register a webhook URL and secret
+      description: |
+        Deliveries are POSTed with headers `x-gacha-event`, `x-gacha-delivery`
+        and `x-gacha-signature: t=<unix seconds>,v1=<hex>`, where `v1` is
+        HMAC-SHA256 over `${t}.${rawBody}` with the secret. Verify on the raw
+        body with a constant-time compare and reject timestamps older than five
+        minutes. Three attempts with backoff (1s, 4s, 16s); dedupe on
+        `x-gacha-delivery`.
+      operationId: registerWebhook
+      security: [{ operatorKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, secret]
+              properties:
+                url: { type: string, format: uri }
+                secret: { type: string, minLength: 16 }
+      responses:
+        "201":
+          description: Registered
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookEndpoint" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+webhooks:
+  pull.opened:
+    post:
+      summary: Slots revealed for a pull
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/WebhookEnvelope"
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        pullId: { type: string }
+                        wallet: { type: string }
+                        tier: { $ref: "#/components/schemas/Tier" }
+                        totalUsdc: { type: number }
+                        signature: { type: string }
+                        slots:
+                          type: array
+                          items: { $ref: "#/components/schemas/Slot" }
+      responses:
+        "2xx": { description: Acknowledged }
+  buyback.paid:
+    post:
+      summary: A slot was sold back and the chain paid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/WebhookEnvelope"
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        pullId: { type: string }
+                        slotId: { type: string }
+                        wallet: { type: string }
+                        amountUsdc: { type: number }
+                        signature: { type: string }
+      responses:
+        "2xx": { description: Acknowledged }
+  pull.shipped:
+    post:
+      summary: A slot was kept
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/WebhookEnvelope"
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        pullId: { type: string }
+                        slotId: { type: string }
+                        wallet: { type: string }
+                        pieceId: { type: string }
+      responses:
+        "2xx": { description: Acknowledged }
+
+components:
+  securitySchemes:
+    playerToken:
+      type: http
+      scheme: bearer
+      description: Privy access token (sandbox: `sandbox:<wallet>`).
+    operatorKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: The machine's operator key. Stored hashed; shown once by the seed script.
+
+  parameters:
+    MachineId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      example: default
+    PullId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    InvalidRequest:
+      description: invalid_request
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthorized:
+      description: unauthorized
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    UnknownMachine:
+      description: unknown_machine
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    UnknownPull:
+      description: unknown_pull
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    MachinePaused:
+      description: machine_paused
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    TxMismatch:
+      description: tx_mismatch
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    SettlementUnconfigured:
+      description: settlement_unconfigured
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  schemas:
+    Tier:
+      type: string
+      enum: [starter, standard, legendary]
+    Rarity:
+      type: string
+      enum: [common, uncommon, rare, epic, grail]
+    Category:
+      type: string
+      enum: [surprise, music, sports, designer]
+    Size:
+      type: string
+      enum: [S, M, L, XL, XXL]
+    Decision:
+      type: string
+      enum: [pending, shipped, soldback]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - unauthorized
+                - invalid_request
+                - unknown_machine
+                - machine_paused
+                - unknown_pull
+                - already_settled
+                - not_settled
+                - tx_mismatch
+                - out_of_stock
+                - already_decided
+                - settlement_unconfigured
+                - internal
+            message: { type: string }
+
+    Machine:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        status: { type: string, enum: [active, paused] }
+        currency: { type: string, const: USDC }
+        pullCounts: { type: array, items: { type: integer } }
+        categories: { type: array, items: { $ref: "#/components/schemas/Category" } }
+        sizes: { type: array, items: { $ref: "#/components/schemas/Size" } }
+        tiers:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { $ref: "#/components/schemas/Tier" }
+              label: { type: string }
+              blurb: { type: string }
+              priceUsdc: { type: number }
+              odds:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    rarity: { $ref: "#/components/schemas/Rarity" }
+                    chancePct: { type: number, description: "0 to 100; a tier's rows sum to 100" }
+                    minUsd: { type: number }
+                    maxUsd: { type: number }
+        buyback:
+          type: object
+          properties:
+            pctByRarity:
+              type: object
+              additionalProperties: { type: number }
+            designerBonusPct: { type: number }
+            capPct: { type: number }
+        pool:
+          type: object
+          properties:
+            availableByRarity:
+              type: object
+              additionalProperties: { type: integer }
+        rules:
+          type: object
+          properties:
+            emptyBucket: { type: string }
+            oddsSource: { type: string }
+
+    CreatePullRequest:
+      type: object
+      required: [machineId, tier, count, category, size]
+      properties:
+        machineId: { type: string, example: default }
+        tier: { $ref: "#/components/schemas/Tier" }
+        count: { type: integer, minimum: 1, maximum: 10 }
+        category: { $ref: "#/components/schemas/Category" }
+        size: { $ref: "#/components/schemas/Size" }
+
+    Piece:
+      type: object
+      properties:
+        id: { type: string }
+        sku: { type: string }
+        name: { type: string }
+        brand: { type: string }
+        era: { type: string }
+        category: { $ref: "#/components/schemas/Category" }
+        size: { $ref: "#/components/schemas/Size" }
+        rarity: { $ref: "#/components/schemas/Rarity" }
+        quality: { type: [number, "null"] }
+        priceUsd: { type: number, description: The house-assigned intake price, the base for buyback. }
+        images: { type: array, items: { type: string } }
+
+    Slot:
+      type: object
+      properties:
+        id: { type: string }
+        piece: { $ref: "#/components/schemas/Piece" }
+        buybackPct: { type: number }
+        buybackValueUsdc: { type: number, description: Frozen at roll time. }
+        decision: { $ref: "#/components/schemas/Decision" }
+        buybackSignature: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+
+    Pull:
+      type: object
+      properties:
+        id: { type: string }
+        machineId: { type: string }
+        status: { type: string, enum: [quoted, paid, opened, expired] }
+        tier: { $ref: "#/components/schemas/Tier" }
+        category: { $ref: "#/components/schemas/Category" }
+        size: { $ref: "#/components/schemas/Size" }
+        count: { type: integer }
+        unitPriceUsdc: { type: number }
+        totalUsdc: { type: number }
+        signature: { type: [string, "null"] }
+        slots:
+          type: array
+          items: { $ref: "#/components/schemas/Slot" }
+        createdAt: { type: string, format: date-time }
+
+    SlotRequest:
+      type: object
+      properties:
+        slot:
+          type: string
+          description: Slot id. Required when the pull has more than one slot.
+
+    BuybackResult:
+      type: object
+      properties:
+        pullId: { type: string }
+        slotId: { type: string }
+        amountUsdc: { type: number }
+        signature: { type: string }
+        decision: { $ref: "#/components/schemas/Decision" }
+
+    ShipResult:
+      type: object
+      properties:
+        pullId: { type: string }
+        slotId: { type: string }
+        decision: { $ref: "#/components/schemas/Decision" }
+
+    IntakeRow:
+      type: object
+      required: [name, price]
+      properties:
+        name: { type: string }
+        brand: { type: string }
+        era: { type: string }
+        category: { $ref: "#/components/schemas/Category" }
+        size: { $ref: "#/components/schemas/Size" }
+        quality: { type: [number, string, "null"] }
+        price: { type: number, exclusiveMinimum: 0 }
+        images: { type: array, items: { type: string } }
+
+    Inventory:
+      type: object
+      properties:
+        machineId: { type: string }
+        pieces:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/Piece"
+              - type: object
+                properties:
+                  status: { type: string, enum: [available, reserved, shipped] }
+                  createdAt: { type: string, format: date-time }
+
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: { type: string }
+        url: { type: string }
+        status: { type: string, enum: [active, disabled] }
+        createdAt: { type: string, format: date-time }
+
+    WebhookDelivery:
+      type: object
+      properties:
+        id: { type: string }
+        webhookId: { type: string }
+        event: { type: string, enum: [pull.opened, buyback.paid, pull.shipped] }
+        status: { type: string, enum: [pending, delivered, failed] }
+        attempts: { type: integer }
+        lastStatus: { type: [integer, "null"] }
+        lastError: { type: [string, "null"] }
+        deliveredAt: { type: [string, "null"], format: date-time }
+        createdAt: { type: string, format: date-time }
+
+    WebhookEnvelope:
+      type: object
+      properties:
+        id: { type: string, description: Delivery id; retries reuse it. }
+        event: { type: string }
+        machineId: { type: string }
+        createdAt: { type: string, format: date-time }
+        data: { type: object }

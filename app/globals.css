@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+/* ─────────────────────────────────────────────────────────────────────────
+   THRIFT MACHINE — brand tokens. Single source of truth for color + type.
+   Soft neo-brutalism: near-white paper, ink borders, hard offset shadows,
+   flat fills, rounded corners. Approved design system.
+   ───────────────────────────────────────────────────────────────────────── */
+@theme {
+  --color-paper: #F5F5F2;
+  --color-surface: #FFFFFF;
+  --color-ink: #0C0C0C;
+  --color-ink-soft: #3A3A36;
+
+  --color-lime: #C2F032;
+  --color-pink: #FFB3D9;
+
+  /* rarity accents */
+  --color-common: #5C5B54;
+  --color-uncommon: #6FA84A;
+  --color-rare: #5B8CFF;
+  --color-epic: #C46BFF;
+  --color-grail: #FFD23F;
+
+  --color-heather: #D7D6D1;
+
+  /* sneaker teaser colorway (blue + orange, separate from the tee brand) */
+  --color-kicks-blue: #2563EB;
+  --color-kicks-orange: #FB923C;
+
+  --font-sans: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-space-mono), ui-monospace, SFMono-Regular, monospace;
+}
+
+:root { color-scheme: light; }
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 5.5rem;
+}
+html, body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+}
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection { background: var(--color-lime); color: var(--color-ink); }
+
+/* ── Neo-brutalist primitives ─────────────────────────────────────────── */
+.shadow-hard    { box-shadow: 5px 5px 0 var(--color-ink); }
+.shadow-hard-sm { box-shadow: 3px 3px 0 var(--color-ink); }
+.shadow-hard-lg { box-shadow: 8px 8px 0 var(--color-ink); }
+
+/* Pressable: element sinks into its own hard shadow on click. Pair with a
+   .shadow-hard* class for the satisfying click. */
+.press { transition: transform .07s ease, box-shadow .07s ease; }
+.press:active:not(:disabled) { transform: translate(3px, 3px); box-shadow: 0 0 0 var(--color-ink); }
+.press:disabled { opacity: .45; cursor: not-allowed; }
+
+/* Dot halftone texture for hero panels */
+.halftone { background-image: radial-gradient(var(--color-ink) 1.1px, transparent 1.3px); background-size: 13px 13px; }
+
+.no-sb::-webkit-scrollbar { display: none; }
+.no-sb { scrollbar-width: none; }
+
+/* ── Reveal + motion ──────────────────────────────────────────────────── */
+@keyframes tm-drop {
+  0%   { transform: translateY(-130%) rotate(-9deg); opacity: 0; }
+  62%  { transform: translateY(5%) rotate(2deg);     opacity: 1; }
+  100% { transform: translateY(0) rotate(0);          opacity: 1; }
+}
+@keyframes tm-pop   { 0% { transform: scale(.7); opacity: 0; } 72% { transform: scale(1.06); } 100% { transform: scale(1); opacity: 1; } }
+@keyframes tm-scrim { from { opacity: 0; } to { opacity: 1; } }
+@keyframes tm-fall  { to { transform: translateY(112vh) rotate(720deg); } }
+@keyframes tm-shimmer { 0%,100% { box-shadow: 0 0 0 var(--color-ink); } 50% { box-shadow: 0 0 22px 2px var(--color-grail); } }
+@keyframes tm-marquee { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+
+.anim-drop  { animation: tm-drop .62s cubic-bezier(.2,.85,.25,1) both; }
+.anim-pop   { animation: tm-pop .42s ease both; }
+.anim-scrim { animation: tm-scrim .25s ease both; }
+.anim-marquee { animation: tm-marquee 32s linear infinite; }
+.grail-glow { animation: tm-shimmer 1.8s ease-in-out infinite; }
