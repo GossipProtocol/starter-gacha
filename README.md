@@ -14,7 +14,7 @@ It runs in three modes:
 
 Every live pull pays **1% of the pull price** to the course wallet. The player pays exactly the listed price; the house receives 99% and the course wallet receives 1%, as a second USDC transfer inside the same pull transaction. The rate and the recipient live in one file, `lib/course-fee.ts`.
 
-The fee is a default, not a license condition. This code is MIT licensed, so you can change it, but the fee is how the course pays for itself and the rate is small enough that most forks leave it. If you change the recipient or the rate, say so in your README.
+The fee is a default, not a license condition. This code is MIT licensed, so you can change it. If you change the recipient or the rate, say so in your README.
 
 ## The API
 
